@@ -1,0 +1,230 @@
+# Ensemble Methods
+## Dr Thomas Robinson | Day 5
+
+This walkthrough combines several models from earlier in the week. The key upgrade from the earlier version is that the stacking weights are now estimated on **out-of-fold** predictions rather than in-sample fitted values, which makes the final ensemble much more credible.
+
+## Package requirements
+
+```{r}
+# install.packages(c("glmnet", "randomForest"))
+
+library(glmnet)
+library(randomForest)
+```
+
+## Load and prepare the data
+
+```{r}
+cces <- read.csv("../data/cces_formatted_oxml.csv")
+
+for (v in seq_along(cces)) {
+  if (is.character(cces[[v]])) {
+    cces[[v]] <- as.factor(cces[[v]])
+  }
+}
+
+cces$votetrump <- ifelse(cces$vote2016 == "Donald Trump", 1, 0)
+
+train_vars <- c(
+  "birthyr", "gender", "educ", "race", "employ",
+  "marstat", "pid3", "ideo5", "newsint"
+)
+
+set.seed(89)
+train_indices <- sample(seq_len(nrow(cces)), size = floor(0.7 * nrow(cces)))
+
+x_train <- cces[train_indices, train_vars, drop = FALSE]
+x_test <- cces[-train_indices, train_vars, drop = FALSE]
+y_train <- cces$votetrump[train_indices]
+y_test <- cces$votetrump[-train_indices]
+```
+
+## Helper functions
+
+```{r}
+fit_logit <- function(X, y) {
+  glm(votetrump ~ ., data = data.frame(votetrump = y, X), family = binomial())
+}
+
+predict_logit <- function(model, new_X) {
+  as.numeric(predict(model, newdata = new_X, type = "response"))
+}
+
+fit_lasso <- function(X, y) {
+  mm <- model.matrix(~ ., data = X)
+
+  list(
+    fit = cv.glmnet(
+      x = mm[, -1, drop = FALSE],
+      y = y,
+      alpha = 1,
+      family = "binomial",
+      type.measure = "deviance"
+    ),
+    columns = colnames(mm),
+    terms = attr(mm, "terms")
+  )
+}
+
+predict_lasso <- function(object, new_X) {
+  mm_new <- model.matrix(object$terms, data = new_X)
+
+  missing_cols <- setdiff(object$columns, colnames(mm_new))
+  if (length(missing_cols) > 0) {
+    for (col in missing_cols) {
+      mm_new <- cbind(mm_new, setNames(data.frame(0), col))
+    }
+  }
+
+  mm_new <- mm_new[, object$columns, drop = FALSE]
+
+  as.numeric(
+    predict(
+      object$fit,
+      newx = mm_new[, -1, drop = FALSE],
+      s = "lambda.1se",
+      type = "response"
+    )
+  )
+}
+
+fit_rf <- function(X, y) {
+  randomForest(votetrump ~ ., data = data.frame(votetrump = factor(y), X), ntree = 500)
+}
+
+predict_rf <- function(model, new_X) {
+  as.numeric(predict(model, newdata = new_X, type = "prob")[, 2])
+}
+
+make_folds <- function(n, v = 5) {
+  sample(rep(seq_len(v), length.out = n))
+}
+
+brier_score <- function(y_true, yhat_prob) {
+  mean((y_true - yhat_prob) ^ 2)
+}
+```
+
+## Estimate out-of-fold predictions
+
+```{r}
+fold_id <- make_folds(nrow(x_train), v = 5)
+
+oof_preds <- data.frame(
+  Y = y_train,
+  logit = NA_real_,
+  lasso = NA_real_,
+  rf = NA_real_
+)
+
+for (fold in sort(unique(fold_id))) {
+  valid_rows <- which(fold_id == fold)
+  fit_rows <- setdiff(seq_len(nrow(x_train)), valid_rows)
+
+  X_fit <- x_train[fit_rows, , drop = FALSE]
+  X_valid <- x_train[valid_rows, , drop = FALSE]
+  y_fit <- y_train[fit_rows]
+
+  logit_fit <- fit_logit(X_fit, y_fit)
+  lasso_fit <- fit_lasso(X_fit, y_fit)
+  rf_fit <- fit_rf(X_fit, y_fit)
+
+  oof_preds$logit[valid_rows] <- predict_logit(logit_fit, X_valid)
+  oof_preds$lasso[valid_rows] <- predict_lasso(lasso_fit, X_valid)
+  oof_preds$rf[valid_rows] <- predict_rf(rf_fit, X_valid)
+}
+
+head(oof_preds)
+```
+
+## Estimate stacking weights
+
+We parameterise the weights so they are automatically non-negative and sum to one.
+
+```{r}
+stack_loss <- function(z, y, preds) {
+  raw_w <- c(z, 0)
+  weights <- exp(raw_w - max(raw_w))
+  weights <- weights / sum(weights)
+
+  mean((y - preds %*% weights) ^ 2)
+}
+
+pred_matrix <- as.matrix(oof_preds[, c("logit", "lasso", "rf")])
+
+stack_opt <- optim(
+  par = c(0, 0),
+  fn = stack_loss,
+  y = oof_preds$Y,
+  preds = pred_matrix
+)
+
+raw_weights <- c(stack_opt$par, 0)
+stack_weights <- exp(raw_weights - max(raw_weights))
+stack_weights <- stack_weights / sum(stack_weights)
+names(stack_weights) <- c("logit", "lasso", "rf")
+
+stack_weights
+```
+
+## Refit constituent models on the full training data
+
+```{r}
+logit_model <- fit_logit(x_train, y_train)
+lasso_model <- fit_lasso(x_train, y_train)
+rf_model <- fit_rf(x_train, y_train)
+```
+
+## Test-set predictions
+
+```{r}
+test_pred_matrix <- cbind(
+  logit = predict_logit(logit_model, x_test),
+  lasso = predict_lasso(lasso_model, x_test),
+  rf = predict_rf(rf_model, x_test)
+)
+
+stack_prob <- as.vector(test_pred_matrix %*% stack_weights)
+stack_pred <- ifelse(stack_prob >= 0.5, 1, 0)
+
+baseline_prob <- rep(mean(y_train), length(y_test))
+baseline_pred <- ifelse(baseline_prob >= 0.5, 1, 0)
+```
+
+## Compare the models
+
+```{r}
+results <- data.frame(
+  model = c("Baseline", "Logit", "LASSO", "Random Forest", "Stacked ensemble"),
+  accuracy = c(
+    mean(baseline_pred == y_test),
+    mean(ifelse(test_pred_matrix[, "logit"] >= 0.5, 1, 0) == y_test),
+    mean(ifelse(test_pred_matrix[, "lasso"] >= 0.5, 1, 0) == y_test),
+    mean(ifelse(test_pred_matrix[, "rf"] >= 0.5, 1, 0) == y_test),
+    mean(stack_pred == y_test)
+  ),
+  brier = c(
+    brier_score(y_test, baseline_prob),
+    brier_score(y_test, test_pred_matrix[, "logit"]),
+    brier_score(y_test, test_pred_matrix[, "lasso"]),
+    brier_score(y_test, test_pred_matrix[, "rf"]),
+    brier_score(y_test, stack_prob)
+  )
+)
+
+results
+```
+
+The ensemble is not guaranteed to dominate every single model on every metric in every sample, but this is the correct logic for stacking: estimate meta-weights using out-of-fold predictions, then test once on held-out data.
+
+## Exercises
+
+1. Add another learner to the library, such as a shallow tree or a neural network.
+
+2. Repeat the exercise using in-sample fitted values instead of out-of-fold predictions. How much more optimistic do the ensemble results become?
+
+3. Calculate subgroup performance for the stacked model. Does the ensemble reduce error equally across groups?
+
+4. Change the meta-loss from mean squared error to log-loss. Do the weights change much?
+
+5. Bin the predicted probabilities and make a simple calibration plot for each learner. Which model is best calibrated?

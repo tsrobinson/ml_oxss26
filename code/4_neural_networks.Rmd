@@ -1,0 +1,225 @@
+# Neural Networks in R
+## Dr Thomas Robinson | Day 4
+
+This walkthrough now uses the local CCES data rather than downloading a generic benchmark dataset. That keeps the exercise self-contained and makes the comparison with earlier models more substantively meaningful for a social-science audience.
+
+The main operational risk with Keras in R is usually the backend and Python environment, not the network code itself. So this notebook is now set up to:
+
+* stay inside the `keras3` API
+* default to a CPU backend for fewer machine-specific failures
+* let students change the architecture without changing the environment logic
+
+## System setup
+
+```{r}
+# install.packages(c("keras3", "recipes", "magrittr"))
+#
+# Recommended for class:
+# 1. Stay on CPU unless you already know your GPU setup works.
+# 2. Pick a backend once and keep it there for the whole session.
+# 3. Let keras3 resolve backend dependencies from that choice.
+# 4. If you want to force a backend before knitting, run for example:
+#    Sys.setenv(KERAS_BACKEND = "torch")
+#    # or:
+#    Sys.setenv(KERAS_BACKEND = "tensorflow")
+#    install_keras() is still supported, but is no longer required here.
+```
+
+## Load packages and data
+
+```{r}
+library(keras3)
+library(magrittr)
+library(recipes)
+
+preferred_backend <- Sys.getenv("KERAS_BACKEND", unset = "torch")
+
+tryCatch(
+  use_backend(preferred_backend, gpu = FALSE),
+  error = function(e) {
+    stop(
+      paste0(
+        "Keras backend setup failed. Try setting one of:\n",
+        "  Sys.setenv(KERAS_BACKEND = \"torch\")\n",
+        "  Sys.setenv(KERAS_BACKEND = \"tensorflow\")\n",
+        "then restart the R session and rerun the notebook.\n\n",
+        "Original error: ", conditionMessage(e)
+      ),
+      call. = FALSE
+    )
+  }
+)
+
+clear_session()
+set_random_seed(89)
+
+message("Using Keras backend: ", config_backend())
+```
+
+```{r}
+cces <- read.csv("../data/cces_formatted_oxml.csv")
+
+for (v in seq_along(cces)) {
+  if (is.character(cces[[v]])) {
+    cces[[v]] <- as.factor(cces[[v]])
+  }
+}
+
+cces$votetrump <- factor(ifelse(cces$vote2016 == "Donald Trump", "Trump", "Other"))
+
+model_vars <- c(
+  "birthyr", "gender", "educ", "race", "employ", "marstat",
+  "pid3", "ideo5", "newsint", "faminc_new", "unionhh",
+  "ownhome", "urbancity", "votetrump"
+)
+
+cces <- cces[, model_vars]
+cces <- na.omit(cces)
+```
+
+## Split the data
+
+```{r}
+set.seed(89)
+
+train_index <- sample(seq_len(nrow(cces)), size = floor(0.7 * nrow(cces)))
+train_data <- cces[train_index, ]
+test_data <- cces[-train_index, ]
+
+y_train <- ifelse(train_data$votetrump == "Trump", 1, 0)
+y_test <- ifelse(test_data$votetrump == "Trump", 1, 0)
+
+baseline_pred <- rep(ifelse(mean(y_train) >= 0.5, 1, 0), length(y_test))
+baseline_acc <- mean(baseline_pred == y_test)
+baseline_acc
+```
+
+## Feature engineering with recipes
+
+```{r}
+rec_obj <- recipe(votetrump ~ ., data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  prep()
+
+train_processed <- bake(rec_obj, new_data = train_data)
+test_processed <- bake(rec_obj, new_data = test_data)
+
+x_train <- as.matrix(train_processed[, setdiff(names(train_processed), "votetrump")])
+x_test <- as.matrix(test_processed[, setdiff(names(test_processed), "votetrump")])
+```
+
+## Build a neural network
+
+```{r}
+build_mlp <- function(input_dim,
+                      hidden_units = c(64, 32),
+                      dropout = 0.25,
+                      learning_rate = 0.001) {
+  model <- keras_model_sequential()
+
+  model <- model %>%
+    layer_input(shape = input_dim)
+
+  for (units in hidden_units) {
+    model <- model %>%
+      layer_dense(units = units, activation = "relu")
+
+    if (dropout > 0) {
+      model <- model %>%
+        layer_dropout(rate = dropout)
+    }
+  }
+
+  model %>%
+    layer_dense(units = 1, activation = "sigmoid") %>%
+    compile(
+      optimizer = optimizer_adam(learning_rate = learning_rate),
+      loss = "binary_crossentropy",
+      metrics = c("accuracy")
+    )
+}
+
+model <- build_mlp(
+  input_dim = ncol(x_train),
+  hidden_units = c(64, 32),
+  dropout = 0.25,
+  learning_rate = 0.001
+)
+```
+
+## Inspect the model
+
+```{r}
+summary(model)
+```
+
+## Train with early stopping
+
+```{r}
+history <- fit(
+  object = model,
+  x = x_train,
+  y = y_train,
+  batch_size = 256,
+  epochs = 40,
+  validation_split = 0.2,
+  callbacks = list(
+    callback_early_stopping(
+      monitor = "val_loss",
+      patience = 3,
+      restore_best_weights = TRUE
+    ),
+    callback_reduce_lr_on_plateau(
+      monitor = "val_loss",
+      factor = 0.5,
+      patience = 2
+    )
+  ),
+  verbose = 0
+)
+```
+
+```{r}
+plot(history)
+```
+
+## Evaluate out-of-sample performance
+
+```{r}
+nn_test_prob <- as.numeric(predict(model, x_test, verbose = 0))
+nn_test_pred <- ifelse(nn_test_prob >= 0.5, 1, 0)
+
+accuracy <- mean(nn_test_pred == y_test)
+brier <- mean((y_test - nn_test_prob) ^ 2)
+
+data.frame(
+  model = c("Baseline", "Neural network"),
+  accuracy = c(baseline_acc, accuracy),
+  brier = c(mean((y_test - mean(y_train)) ^ 2), brier)
+)
+```
+
+This is the main applied lesson from today: neural networks often require more preprocessing and more tuning than earlier models, so they should earn their place in the workflow by improving predictive performance or by solving a representation-learning problem that simpler models cannot handle well.
+
+## Exercises
+
+1. Compare this neural network to your random forest and BART results from Day 3. Does the neural network clearly outperform them?
+
+2. Change the architecture:
+   * number of hidden layers
+   * number of units
+   * dropout rate
+   * batch size
+
+3. Try a multi-class version of the problem by predicting `"Trump"`, `"Clinton"`, or `"Other"`. What needs to change in the final layer and the loss function?
+
+4. Calculate performance separately by `gender` or `race`. Does the model perform similarly across groups?
+
+5. Introduce missingness into one or two predictors and compare:
+   * complete-case analysis
+   * simple imputation inside the train/test workflow
+   * an explicit missingness indicator
+
+Which choice looks safest substantively?

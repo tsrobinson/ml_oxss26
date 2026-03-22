@@ -1,0 +1,184 @@
+# LASSO models and post-double selection
+## Dr Thomas Robinson | Day 2
+
+This code adapts the replication materials from Blackwell and Olson's work on post-double selection for interactions. The main upgrade from the earlier version is that the LASSO penalty is now chosen with cross-validation rather than fixed by hand, and the final inference stage correctly treats the binary outcome as a logistic model.
+
+## Package requirements and data pre-processing
+
+```{r}
+# install.packages("haven")
+# install.packages("glmnet")
+
+library(haven)
+library(glmnet)
+```
+
+First, read in the data and construct the additional variables used in the analysis:
+
+```{r}
+emw <- read_dta("../data/efmw_replication.dta")
+
+emw$dist <- log(1 + (1 / emw$dist_coast))
+emw$distwremit <- log(1 + ((emw$richremit / 1000000) * emw$dist))
+```
+
+Now restrict to the variables we need and remove rows with missing values. This is still a teaching simplification, not a recommendation for applied work — in practice you should think carefully about *why* rows are missing and what dropping them does to the target population.
+
+```{r}
+emw <- emw[, c(
+  "Protest", "remit", "dict", "l1gdp", "l1pop", "l1nbr5", "l12gr",
+  "l1migr", "elec3", "cowcode", "period", "distwremit",
+  "caseid", "year"
+)]
+
+n_before <- nrow(emw)
+emw <- na.omit(emw)
+cat("Rows before na.omit:", n_before, "| after:", nrow(emw),
+    "| dropped:", n_before - nrow(emw), "\n")
+
+controls <- c("l1gdp", "l1pop", "l1nbr5", "l12gr", "l1migr", "elec3")
+
+# Sum-to-zero contrasts avoid aliasing a single reference category with the
+# intercept, which matters when the intercept is not penalised but the fixed
+# effects are.  This is a common choice for penalised models.
+contr.list <- list(contr.sum, contr.sum)
+names(contr.list) <- c("factor(period)", "factor(cowcode)")
+mod_mat <- model.matrix(
+  ~ factor(period) + factor(cowcode),
+  data = emw,
+  contrasts.arg = contr.list
+)[, -1]
+```
+
+## Define the matrices used in post-double selection
+
+```{r}
+X <- as.matrix(cbind(emw[, controls], mod_mat))
+V <- emw$dict
+VX <- as.matrix(V * X)
+D <- emw$remit
+DV <- D * V
+Y <- emw$Protest
+
+RHS_matrix <- as.matrix(cbind(V = V, X, VX))
+colnames(RHS_matrix) <- c("V", colnames(X), paste0("V_", colnames(X)))
+```
+
+## Stage 1. Estimate cross-validated LASSO models
+
+```{r}
+set.seed(89)
+
+cv_lasso_selector <- function(LHS, RHS, family = c("gaussian", "binomial")) {
+  family <- match.arg(family)
+  type_measure <- if (family == "binomial") "deviance" else "mse"
+
+  fit <- cv.glmnet(
+    x = RHS,
+    y = LHS,
+    alpha = 1,
+    family = family,
+    type.measure = type_measure,
+    nfolds = 10
+  )
+
+  selected <- which(as.vector(coef(fit, s = "lambda.1se")) != 0) - 1
+
+  list(
+    fit = fit,
+    lambda = fit$lambda.1se,
+    index = selected[selected > 0]
+  )
+}
+
+Y_lasso <- cv_lasso_selector(LHS = Y, RHS = RHS_matrix, family = "binomial")
+D_lasso <- cv_lasso_selector(LHS = D, RHS = RHS_matrix, family = "gaussian")
+DV_lasso <- cv_lasso_selector(LHS = DV, RHS = RHS_matrix, family = "gaussian")
+
+selected_columns <- sort(unique(c(Y_lasso$index, D_lasso$index, DV_lasso$index)))
+selected_names <- colnames(RHS_matrix)[selected_columns]
+
+cat("Y lambda.1se:", round(Y_lasso$lambda, 5), "\n")
+cat("D lambda.1se:", round(D_lasso$lambda, 5), "\n")
+cat("DV lambda.1se:", round(DV_lasso$lambda, 5), "\n")
+cat("Number of selected columns:", length(selected_columns), "\n")
+head(selected_names, 20)
+```
+
+The `cv.glmnet` object stores the cross-validation curve. Plotting it shows how the error changes across the regularisation path and where the two common lambda choices (`lambda.min` and `lambda.1se`) fall.
+
+```{r}
+plot(Y_lasso$fit, main = "CV curve for Y (Protest) model")
+```
+
+## Stage 2. Estimate the inference model
+
+To follow the logic of the method more closely, we keep the base terms and then add any selected interaction-type controls from Stage 1.
+
+```{r}
+selected_interactions <- setdiff(selected_names, c("V", colnames(X)))
+
+ds_matrix <- data.frame(
+  Protest = Y,
+  remit = D,
+  dict = V,
+  remit_dict = DV,
+  as.data.frame(X),
+  as.data.frame(RHS_matrix[, selected_interactions, drop = FALSE])
+)
+
+ds_matrix <- ds_matrix[, !duplicated(names(ds_matrix))]
+```
+
+Now compare the naive model against the post-double-selection model:
+
+```{r}
+ds_model <- glm(Protest ~ ., data = ds_matrix, family = binomial())
+
+naive_model <- glm(
+  Protest ~ remit * dict + l1gdp + l1pop + l1nbr5 + l12gr + l1migr + elec3 +
+    factor(period) + factor(cowcode),
+  data = emw,
+  family = binomial()
+)
+```
+
+```{r}
+message("Naive model:")
+coef(summary(naive_model))[c("remit", "remit:dict"), ]
+
+message("Post-double-selection model:")
+coef(summary(ds_model))[c("remit", "remit_dict"), ]
+```
+
+The key idea is that we used LASSO as a **selection** device, then moved back to a conventional inference model for the second stage.
+
+## Quick train/test check
+
+The analysis above is an inference exercise, but we can still ask: does the post-double-selection model predict better than the naive model on held-out data? This reinforces the train/validation/test idea from the lecture.
+
+```{r}
+set.seed(42)
+test_idx <- sample(seq_len(nrow(emw)), size = floor(0.2 * nrow(emw)))
+test_rows <- emw[test_idx, ]
+
+naive_test_prob <- predict(naive_model, newdata = test_rows, type = "response")
+ds_test_prob <- predict(ds_model, newdata = ds_matrix[test_idx, ], type = "response")
+
+brier <- function(y, p) mean((y - p)^2)
+
+cat("Naive model  — test Brier score:", round(brier(test_rows$Protest, naive_test_prob), 4), "\n")
+cat("PDS model    — test Brier score:", round(brier(test_rows$Protest, ds_test_prob), 4), "\n")
+```
+
+Note: this is a rough illustration only. Because both models were estimated on the full data, the test split is not truly held out. Exercise 3 below asks you to fix this properly.
+
+## Exercises
+
+1. Change `lambda.1se` to `lambda.min`. What happens to the number of selected variables?
+
+2. Simulate a dataset with many weak predictors and only a few strong ones. Does cross-validated LASSO recover the strong signals?
+
+3. Add a train/test split before Stage 1 and compare the predictive performance of the naive model and the post-double-selection model.
+
+4. Read Blackwell and Olson more closely and identify which aspects of their full procedure are still simplified here.

@@ -1,0 +1,176 @@
+# Random Forest and BART Predictions
+## Dr Thomas Robinson | Day 3
+
+This walkthrough uses the Cooperative Congressional Election Study 2018 data and predicts whether respondents voted for Donald Trump rather than another candidate. The notebook has been updated to use the data file that actually exists in this repository, to include a simple validation step for random forest tuning, and to report a baseline benchmark alongside the ML models.
+
+## Package requirements
+
+```{r}
+# install.packages("randomForest")
+# install.packages("BART")
+
+library(randomForest)
+library(BART)
+```
+
+## Load the cleaned data
+
+```{r}
+cces <- read.csv("../data/cces_formatted_oxml.csv")
+
+for (v in seq_along(cces)) {
+  if (is.character(cces[[v]])) {
+    cces[[v]] <- as.factor(cces[[v]])
+  }
+}
+
+cces$votetrump <- factor(ifelse(cces$vote2016 == "Donald Trump", "Trump", "Other"))
+cces$vote2016 <- NULL
+```
+
+## Train/test split
+
+```{r}
+set.seed(89)
+
+train_indices <- sample(seq_len(nrow(cces)), size = floor(0.7 * nrow(cces)))
+train_full <- cces[train_indices, ]
+test_data <- cces[-train_indices, ]
+
+test_x <- test_data[, setdiff(names(test_data), "votetrump"), drop = FALSE]
+test_y <- test_data$votetrump
+
+majority_class <- names(sort(table(train_full$votetrump), decreasing = TRUE))[1]
+baseline_pred <- factor(rep(majority_class, length(test_y)), levels = levels(test_y))
+
+mean(baseline_pred == test_y)
+```
+
+## A quick validation split for random forest tuning
+
+```{r}
+valid_indices <- sample(seq_len(nrow(train_full)), size = floor(0.2 * nrow(train_full)))
+train_data <- train_full[-valid_indices, ]
+valid_data <- train_full[valid_indices, ]
+
+tune_grid <- expand.grid(
+  mtry = c(2, 4, 6),
+  ntree = c(300, 600)
+)
+
+tune_grid$valid_acc <- NA_real_
+
+for (g in seq_len(nrow(tune_grid))) {
+  rf_fit <- randomForest(
+    votetrump ~ .,
+    data = train_data,
+    mtry = tune_grid$mtry[g],
+    ntree = tune_grid$ntree[g]
+  )
+
+  rf_valid_pred <- predict(
+    rf_fit,
+    newdata = valid_data[, setdiff(names(valid_data), "votetrump"), drop = FALSE],
+    type = "class"
+  )
+
+  tune_grid$valid_acc[g] <- mean(rf_valid_pred == valid_data$votetrump)
+}
+
+tune_grid[order(-tune_grid$valid_acc), ]
+```
+
+## Fit the final random forest
+
+```{r}
+best_rf <- tune_grid[which.max(tune_grid$valid_acc), ]
+
+rf_model <- randomForest(
+  votetrump ~ .,
+  data = train_full,
+  mtry = best_rf$mtry,
+  ntree = best_rf$ntree,
+  importance = TRUE
+)
+```
+
+```{r}
+importance(rf_model)
+varImpPlot(rf_model)
+```
+
+## Out-of-sample random forest performance
+
+```{r}
+rf_predictions <- predict(rf_model, newdata = test_x, type = "class")
+rf_accuracy <- mean(rf_predictions == test_y)
+rf_accuracy
+```
+
+## Fit a BART model
+
+```{r}
+gc()
+
+x_train_bart <- bartModelMatrix(train_full[, setdiff(names(train_full), "votetrump"), drop = FALSE])
+x_test_bart <- bartModelMatrix(test_x)
+
+bart_model <- pbart(
+  x.train = x_train_bart,
+  y.train = ifelse(train_full$votetrump == "Trump", 1, 0),
+  x.test = x_test_bart,
+  ntree = 75L,
+  numcut = 100L
+)
+```
+
+```{r}
+bart_pred_prob <- bart_model$prob.test.mean
+bart_predictions <- factor(
+  ifelse(bart_pred_prob >= 0.5, "Trump", "Other"),
+  levels = levels(test_y)
+)
+
+bart_accuracy <- mean(bart_predictions == test_y)
+bart_accuracy
+```
+
+## Compare models
+
+```{r}
+comparison <- data.frame(
+  model = c("Baseline", "Random Forest", "BART"),
+  accuracy = c(
+    mean(baseline_pred == test_y),
+    rf_accuracy,
+    bart_accuracy
+  )
+)
+
+comparison
+```
+
+```{r}
+head(
+  data.frame(
+    y_true = test_y,
+    y_rf = rf_predictions,
+    y_bart = bart_predictions
+  )
+)
+```
+
+Two reminders:
+
+1. Variable importance from random forests is useful descriptively, but it is not a causal effect.
+2. BART is often attractive in social-science applications because it gives a flexible predictive surface and uncertainty draws at the same time.
+
+## Exercises
+
+1. Expand the tuning grid for the random forest. Do the results change much?
+
+2. Tune the BART `ntree` hyperparameter and compare the resulting out-of-sample accuracy.
+
+3. Calculate subgroup accuracy by one demographic variable such as `gender` or `race`. Do the models perform equally well across groups?
+
+4. Replace overall accuracy with another metric such as precision, recall, or the Brier score. Does that change your ranking of the models?
