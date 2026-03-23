@@ -1,7 +1,7 @@
 # Constructing a logistic regression estimator
 ## Dr Thomas Robinson | Day 1
 
-In this exercise we will build a simple binary classifier from scratch, then compare it against R's built-in logistic regression. The main upgrade from the earlier version is that we now use a train/test split, safer loss calculations, and an explicit stopping rule.
+In this exercise we will build a simple binary classifier from scratch, then compare it against R's built-in logistic regression. The focus is on understanding how SGD recovers the true coefficients.
 
 ## Simulate a classification problem
 
@@ -20,14 +20,7 @@ y <- rbinom(n, 1, p_true)
 
 data_all <- data.frame(y = y, features)
 
-train_idx <- sample(seq_len(nrow(data_all)), size = 0.7 * nrow(data_all))
-train_data <- data_all[train_idx, ]
-test_data <- data_all[-train_idx, ]
-
-X_train <- as.matrix(cbind(Intercept = 1, train_data[, c("X1", "X2")]))
-X_test <- as.matrix(cbind(Intercept = 1, test_data[, c("X1", "X2")]))
-y_train <- train_data$y
-y_test <- test_data$y
+X <- as.matrix(cbind(Intercept = 1, data_all[, c("X1", "X2")]))
 
 coef_true <- c(3, 1, -2)
 ```
@@ -47,52 +40,25 @@ neg_log_lik <- function(y_true, yhat_prob, eps = 1e-12) {
   yhat_prob <- pmin(pmax(yhat_prob, eps), 1 - eps)
   -mean(y_true * log(yhat_prob) + (1 - y_true) * log(1 - yhat_prob))
 }
-
-brier_score <- function(y_true, yhat_prob) {
-  mean((y_true - yhat_prob) ^ 2)
-}
-
-accuracy <- function(y_true, yhat_prob, threshold = 0.5) {
-  mean(ifelse(yhat_prob >= threshold, 1, 0) == y_true)
-}
-
-assess_classifier <- function(y_true, yhat_prob) {
-  c(
-    nll = neg_log_lik(y_true, yhat_prob),
-    brier = brier_score(y_true, yhat_prob),
-    accuracy = accuracy(y_true, yhat_prob)
-  )
-}
 ```
 
 ## A naive coefficient guess
 
 ```{r}
 coef_guess <- c(0, 0.5, 1)
-guess_train_prob <- predict_prob(X_train, coef_guess)
-rbind(
-  naive_guess = round(assess_classifier(y_train, guess_train_prob), 4),
-  true_coefficients = round(assess_classifier(y_train, predict_prob(X_train, coef_true)), 4)
-)
+cat("NLL with naive guess:       ", round(neg_log_lik(y, predict_prob(X, coef_guess)), 4), "\n")
+cat("NLL with true coefficients: ", round(neg_log_lik(y, predict_prob(X, coef_true)), 4), "\n")
 ```
 
 ## Logistic regression via stochastic gradient descent
 
 ```{r}
-train_logit_sgd <- function(X, y, l_rate = 0.01, max_epochs = 200, tol = 1e-05,
-                            patience = 5, shuffle = TRUE) {
+train_logit_sgd <- function(X, y, l_rate = 0.01, max_epochs = 200) {
   coefficients <- rep(0, ncol(X))
   history <- vector("list", max_epochs)
-  patience_left <- patience
-  previous_nll <- Inf
 
   for (epoch in seq_len(max_epochs)) {
-    row_order <- seq_len(nrow(X))
-    if (shuffle) {
-      row_order <- sample(row_order)
-    }
-
-    for (i in row_order) {
+    for (i in seq_len(nrow(X))) {
       row_vec <- X[i, ]
       yhat_i <- predict_prob(matrix(row_vec, nrow = 1), coefficients)
       gradient <- (yhat_i - y[i]) * row_vec
@@ -101,29 +67,14 @@ train_logit_sgd <- function(X, y, l_rate = 0.01, max_epochs = 200, tol = 1e-05,
 
     train_prob <- predict_prob(X, coefficients)
     epoch_nll <- neg_log_lik(y, train_prob)
-    epoch_brier <- brier_score(y, train_prob)
-    history[[epoch]] <- data.frame(epoch = epoch, nll = epoch_nll, brier = epoch_brier)
+    history[[epoch]] <- data.frame(epoch = epoch, nll = epoch_nll)
 
     message(
       paste0(
         "Epoch ", epoch, "/", max_epochs,
-        " | NLL = ", round(epoch_nll, 5),
-        " | Brier = ", round(epoch_brier, 5)
+        " | NLL = ", round(epoch_nll, 5)
       )
     )
-
-    if (abs(previous_nll - epoch_nll) < tol) {
-      patience_left <- patience_left - 1
-    } else {
-      patience_left <- patience
-    }
-
-    if (patience_left == 0) {
-      message("Stopping early because the loss has stabilised.")
-      break
-    }
-
-    previous_nll <- epoch_nll
   }
 
   list(coefficients = coefficients, history = do.call(rbind, history))
@@ -133,14 +84,14 @@ train_logit_sgd <- function(X, y, l_rate = 0.01, max_epochs = 200, tol = 1e-05,
 ## Fit the model
 
 ```{r}
-sgd_fit <- train_logit_sgd(X_train, y_train, l_rate = 0.02, max_epochs = 150)
+sgd_fit <- train_logit_sgd(X, y, l_rate = 0.02, max_epochs = 150)
 round(sgd_fit$coefficients, 3)
 ```
 
 ## Compare coefficients and convergence
 
 ```{r}
-glm_fit <- glm(y ~ X1 + X2, data = train_data, family = binomial())
+glm_fit <- glm(y ~ X1 + X2, data = data_all, family = binomial())
 
 rbind(
   true = coef_true,
@@ -162,33 +113,7 @@ plot(
 )
 ```
 
-## Out-of-sample performance
-
-```{r}
-sgd_test_prob <- predict_prob(X_test, sgd_fit$coefficients)
-glm_test_prob <- predict(glm_fit, newdata = test_data, type = "response")
-baseline_prob <- rep(mean(y_train), length(y_test))
-
-round(
-  rbind(
-    baseline = assess_classifier(y_test, baseline_prob),
-    sgd = assess_classifier(y_test, sgd_test_prob),
-    glm = assess_classifier(y_test, glm_test_prob)
-  ),
-  4
-)
-```
-
 The SGD model should be quite close to the built-in `glm()` estimator. That is the main point of the exercise: machine learning optimisation is often an alternative route to a familiar estimator, not a completely separate universe.
-
-## Confusion matrix
-
-A confusion matrix shows how predictions break down into true/false positives and negatives. This matters more than headline accuracy when classes are imbalanced or when different errors carry different costs.
-
-```{r}
-sgd_pred_class <- ifelse(sgd_test_prob >= 0.5, 1, 0)
-table(Predicted = sgd_pred_class, Actual = y_test)
-```
 
 ## Decision boundary
 
@@ -209,7 +134,7 @@ ggplot() +
   geom_tile(data = grid, aes(x = X1, y = X2, fill = prob), alpha = 0.4) +
   scale_fill_gradient2(low = "firebrick", mid = "white", high = "dodgerblue3",
                        midpoint = 0.5, name = "P(y = 1)") +
-  geom_point(data = test_data, aes(x = X1, y = X2, colour = factor(y)),
+  geom_point(data = data_all, aes(x = X1, y = X2, colour = factor(y)),
              size = 1.5) +
   scale_colour_manual(values = c("0" = "firebrick", "1" = "dodgerblue3"),
                       name = "Actual class") +
@@ -218,7 +143,7 @@ ggplot() +
     slope = -sgd_fit$coefficients[2] / sgd_fit$coefficients[3],
     linewidth = 1, linetype = "dashed"
   ) +
-  labs(title = "SGD decision boundary on test data") +
+  labs(title = "SGD decision boundary") +
   theme_minimal()
 ```
 
@@ -226,10 +151,8 @@ ggplot() +
 
 1. Change the learning rate. What happens if it is too small? What happens if it is too large?
 
-2. Turn `shuffle = FALSE`. Does training become slower or less stable?
+2. Implement a stopping rule so the algorithm stops early once the loss stabilises. Hint: compare the NLL across consecutive epochs.
 
-3. Replace the stopping rule with a maximum patience over the **test** loss. Why is that a bad idea?
+3. Add a third predictor `X3` that has no true effect on the outcome. Does the algorithm still learn a near-zero coefficient?
 
-4. Add a third predictor `X3` that has no true effect on the outcome. Does the algorithm still learn a near-zero coefficient?
-
-5. BONUS: implement mini-batch gradient descent so that each update uses, say, 25 observations at a time instead of a single row.
+4. BONUS: implement mini-batch gradient descent so that each update uses, say, 25 observations at a time instead of a single row.
