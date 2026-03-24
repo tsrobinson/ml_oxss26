@@ -82,6 +82,8 @@ tune_grid[order(-tune_grid$valid_acc), ]
 
 ## Fit the final random forest
 
+Now that we have chosen hyperparameters, we re-fit on all of `train_full` (including the validation rows). The validation split was only needed to *select* hyperparameters — once that decision is made, we want the final model to use as much training data as possible.
+
 ```{r}
 best_rf <- tune_grid[which.max(tune_grid$valid_acc), ]
 
@@ -110,7 +112,9 @@ rf_accuracy
 ## Fit a BART model
 
 ```{r}
+# Free memory from the random forest tuning before fitting BART
 gc()
+set.seed(89)
 
 x_train_bart <- bartModelMatrix(train_full[, setdiff(names(train_full), "votetrump"), drop = FALSE])
 x_test_bart <- bartModelMatrix(test_x)

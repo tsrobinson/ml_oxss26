@@ -1,0 +1,225 @@
+# Missing data and MIDAS imputation
+## Dr Thomas Robinson | Day 4
+
+On Day 2 we studied the remittances--protest relationship from Escriba-Folch, Meseguer, and Wright (2018) using post-double selection. But the very first thing we did was drop every row with a missing value:
+
+```r
+emw <- na.omit(emw)
+```
+
+How much data did that discard, and does it matter for the substantive conclusions? This exercise uses **rMIDAS2** — a denoising-autoencoder approach to multiple imputation (Lall and Robinson 2022, *Political Analysis*) — to find out.
+
+The plan:
+
+1. Examine the missingness in the original data
+2. Impute the missing values with rMIDAS2
+3. Re-run the naive interaction model on the imputed data, pooling with Rubin's rules
+4. Compare to the complete-case estimates from Day 2
+
+We deliberately keep the inference model simple (the naive specification, not PDS) because combining LASSO variable selection with multiple imputation raises open methodological questions that go beyond what we can resolve here.
+
+## Setup
+
+```{r}
+# install.packages("rMIDAS2")
+# rMIDAS2::install_backend()   # one-time: creates a Python env with the MIDAS2 engine
+
+library(haven)
+library(rMIDAS2)
+```
+
+## Load the data
+
+We load the same dataset as Day 2, construct the same derived variables, and select the analysis columns — but this time we do **not** call `na.omit`.
+
+```{r}
+emw_raw <- read_dta("../data/efmw_replication.dta")
+
+emw_raw$dist <- log(1 + (1 / emw_raw$dist_coast))
+emw_raw$distwremit <- log(1 + ((emw_raw$richremit / 1000000) * emw_raw$dist))
+
+analysis_vars <- c(
+  "Protest", "remit", "dict", "l1gdp", "l1pop", "l1nbr5", "l12gr",
+  "l1migr", "elec3", "cowcode", "period"
+)
+
+emw_raw <- emw_raw[, analysis_vars]
+```
+
+## 1. Examine the missingness
+
+Before imputing, we should understand *what* is missing and *how much*.
+
+```{r}
+# Per-variable missingness
+miss_count <- colSums(is.na(emw_raw))
+miss_pct <- round(100 * miss_count / nrow(emw_raw), 1)
+
+data.frame(
+  variable = names(miss_count),
+  n_missing = miss_count,
+  pct_missing = miss_pct,
+  row.names = NULL
+)
+
+cat("\nTotal rows:", nrow(emw_raw),
+    "| Complete cases:", sum(complete.cases(emw_raw)),
+    "| Rows with any NA:", sum(!complete.cases(emw_raw)), "\n")
+```
+
+This is the data that `na.omit` on Day 2 silently discarded. If the missingness is related to the outcome or treatment, complete-case analysis can bias the estimates.
+
+## 2. Complete-case baseline
+
+First, let's reproduce the Day 2 naive model on complete cases so we have a reference point.
+
+```{r}
+emw_cc <- na.omit(emw_raw)
+
+naive_cc <- lm(
+  Protest ~ remit * dict + l1gdp + l1pop + l1nbr5 + l12gr + l1migr + elec3 +
+    factor(period) + factor(cowcode),
+  data = emw_cc
+)
+
+cat("Complete-case naive model (n =", nrow(emw_cc), "):\n")
+round(coef(summary(naive_cc))[c("remit", "dict", "remit:dict"), ], 4)
+```
+
+## 3. Impute with rMIDAS2
+
+rMIDAS2 fits a denoising autoencoder to the data and generates multiple completed datasets. The key idea: the network learns the joint distribution of all variables by training on artificially corrupted copies of the observed data, then uses that learned distribution to fill in the genuine missing values.
+
+We pass in the raw data frame directly — rMIDAS2 detects column types automatically.
+
+```{r}
+set.seed(89)
+
+midas_result <- midas(
+  data = emw_raw,
+  m = 10,                          # number of imputations
+  hidden_layers = c(256, 128, 64), # three-layer autoencoder
+  epochs = 50,                     # training epochs
+  seed = 89
+)
+
+cat("Generated", length(midas_result$imputations), "completed datasets\n")
+cat("Each has", nrow(midas_result$imputations[[1]]), "rows (no NAs)\n")
+```
+
+Let's verify that the imputations look reasonable by comparing the distribution of an imputed variable against its observed values.
+
+```{r}
+# Compare observed vs imputed distribution for a variable with missingness
+check_var <- names(which(miss_count > 0))[1]  # pick the first variable with NAs
+
+if (!is.null(check_var)) {
+  observed_vals <- emw_raw[[check_var]][!is.na(emw_raw[[check_var]])]
+  imputed_vals <- midas_result$imputations[[1]][[check_var]]
+
+  cat("Variable:", check_var, "\n")
+  cat("Observed — mean:", round(mean(observed_vals), 3),
+      "sd:", round(sd(observed_vals), 3), "\n")
+  cat("Imputed  — mean:", round(mean(imputed_vals), 3),
+      "sd:", round(sd(imputed_vals), 3), "\n")
+}
+```
+
+## 4. Overimputation diagnostic
+
+Overimputation masks a fraction of *observed* values, re-imputes them, and measures accuracy. This gives us a sense of how well the model recovers known values — our best available check on imputation quality.
+
+```{r}
+overimp <- overimpute(midas_result, mask_frac = 0.1, m = 5)
+
+cat("Mean RMSE across variables:", round(overimp$mean_rmse, 4), "\n\n")
+cat("Per-variable RMSE:\n")
+print(round(overimp$rmse, 4))
+```
+
+## 5. Pool the naive model with Rubin's rules
+
+Now we re-estimate the same naive interaction model on each imputed dataset and combine the results using Rubin's rules. This accounts for both within-imputation uncertainty (the usual standard errors) and between-imputation uncertainty (variation across the *m* completed datasets).
+
+We use `combine()` from rMIDAS2, which handles the pooling internally.
+
+```{r}
+# We need to construct the interaction and factor terms in each imputed dataset,
+# then run the model manually across imputations and pool.
+
+pool_naive <- function(imputations) {
+  fits <- lapply(imputations, function(imp) {
+    lm(
+      Protest ~ remit * dict + l1gdp + l1pop + l1nbr5 + l12gr + l1migr + elec3 +
+        factor(period) + factor(cowcode),
+      data = imp
+    )
+  })
+
+  # Extract coefficients and variances from each fit
+  m <- length(fits)
+  coef_mat <- sapply(fits, coef)
+  var_list <- lapply(fits, function(f) diag(vcov(f)))
+
+  # Rubin's rules
+  Q_bar <- rowMeans(coef_mat)                              # pooled estimate
+  U_bar <- Reduce("+", var_list) / m                       # within-imputation variance
+  B <- apply(coef_mat, 1, var)                             # between-imputation variance
+  T_total <- U_bar + (1 + 1 / m) * B                      # total variance
+
+  data.frame(
+    term = names(Q_bar),
+    estimate = Q_bar,
+    std.error = sqrt(T_total),
+    row.names = NULL
+  )
+}
+
+pooled <- pool_naive(midas_result$imputations)
+```
+
+## 6. Compare complete-case vs multiply-imputed estimates
+
+```{r}
+key_terms <- c("remit", "dict", "remit:dict")
+
+cc_coefs <- coef(summary(naive_cc))[key_terms, c("Estimate", "Std. Error")]
+mi_coefs <- pooled[pooled$term %in% key_terms, ]
+
+comparison <- data.frame(
+  term = key_terms,
+  cc_estimate = round(cc_coefs[, "Estimate"], 4),
+  cc_se = round(cc_coefs[, "Std. Error"], 4),
+  mi_estimate = round(mi_coefs$estimate, 4),
+  mi_se = round(mi_coefs$std.error, 4),
+  row.names = NULL
+)
+
+comparison
+```
+
+Look at the differences:
+
+- **Point estimates**: do the coefficients change direction or magnitude?
+- **Standard errors**: MI standard errors should typically be *larger* than complete-case SEs, because they honestly reflect the additional uncertainty from not knowing the missing values.
+- **Substantive conclusion**: does the interaction between remittances and regime type hold up once we account for the missing data?
+
+## Why we stopped here
+
+Combining multiple imputation with post-double selection (the LASSO-based procedure from Day 2) is not straightforward. The core difficulty: LASSO might select *different* variables in each imputed dataset, which means the Stage 2 model specification varies across imputations. There is no consensus on how to handle this — union of selected sets, intersection, majority vote — and the theoretical guarantees for PDS assume a fixed design.
+
+For applied work, this is an active area of methodological research. The pragmatic options are:
+
+1. **Impute first, then select on each dataset** and take the union of selected variables (conservative but defensible)
+2. **Select on complete cases, then impute and estimate** (assumes missingness does not affect which variables matter)
+3. **Use a method designed for joint selection and imputation** (an open research frontier)
+
+The takeaway for this course: missing data is not just a preprocessing step to get out of the way. The choice between complete-case analysis and imputation can change your conclusions, and the interaction between imputation and model selection deserves careful thought.
+
+## Exercises
+
+1. Change the number of imputations from 10 to 50. Do the pooled estimates stabilise?
+
+2. Examine the overimputation diagnostics more carefully. Which variables are hardest to recover? Does this match your expectations based on the missingness patterns?
+
+3. Try varying the network architecture (`hidden_layers`) or the number of training epochs. How sensitive are the results?
