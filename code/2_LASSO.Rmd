@@ -64,7 +64,7 @@ V <- emw$dict       # binary moderator: 1 = autocracy
 VX <- as.matrix(V * X)
 D <- emw$remit       # continuous treatment: remittances
 DV <- D * V          # treatment-moderator interaction
-Y <- emw$Protest     # binary outcome
+Y <- emw$Protest     # continuous outcome (protest measure)
 
 RHS_matrix <- as.matrix(cbind(V = V, X, VX))
 colnames(RHS_matrix) <- c("V", colnames(X), paste0("V_", colnames(X)))
@@ -77,16 +77,13 @@ PDS runs LASSO on the outcome $Y$, the treatment $D$, and the treatment--moderat
 ```{r}
 set.seed(89)
 
-cv_lasso_selector <- function(LHS, RHS, family = c("gaussian", "binomial")) {
-  family <- match.arg(family)
-  type_measure <- if (family == "binomial") "deviance" else "mse"
-
+cv_lasso_selector <- function(LHS, RHS) {
   fit <- cv.glmnet(
     x = RHS,
     y = LHS,
     alpha = 1,
-    family = family,
-    type.measure = type_measure,
+    family = "gaussian",
+    type.measure = "mse",
     nfolds = 10
   )
 
@@ -99,9 +96,11 @@ cv_lasso_selector <- function(LHS, RHS, family = c("gaussian", "binomial")) {
   )
 }
 
-Y_lasso <- cv_lasso_selector(LHS = Y, RHS = RHS_matrix, family = "binomial")
-D_lasso <- cv_lasso_selector(LHS = D, RHS = RHS_matrix, family = "gaussian")
-DV_lasso <- cv_lasso_selector(LHS = DV, RHS = RHS_matrix, family = "gaussian")
+# All three outcomes are continuous, so all use family = "gaussian"
+# (the paper uses OLS throughout this application)
+Y_lasso <- cv_lasso_selector(LHS = Y, RHS = RHS_matrix)
+D_lasso <- cv_lasso_selector(LHS = D, RHS = RHS_matrix)
+DV_lasso <- cv_lasso_selector(LHS = DV, RHS = RHS_matrix)
 
 selected_columns <- sort(unique(c(Y_lasso$index, D_lasso$index, DV_lasso$index)))
 selected_names <- colnames(RHS_matrix)[selected_columns]
@@ -141,13 +140,12 @@ ds_matrix <- ds_matrix[, !duplicated(names(ds_matrix))]
 Now compare the naive model against the post-double-selection model:
 
 ```{r}
-ds_model <- glm(Protest ~ ., data = ds_matrix, family = binomial())
+ds_model <- lm(Protest ~ ., data = ds_matrix)
 
-naive_model <- glm(
+naive_model <- lm(
   Protest ~ remit * dict + l1gdp + l1pop + l1nbr5 + l12gr + l1migr + elec3 +
     factor(period) + factor(cowcode),
-  data = emw,
-  family = binomial()
+  data = emw
 )
 ```
 
@@ -170,13 +168,13 @@ set.seed(42)
 test_idx <- sample(seq_len(nrow(emw)), size = floor(0.2 * nrow(emw)))
 test_rows <- emw[test_idx, ]
 
-naive_test_prob <- predict(naive_model, newdata = test_rows, type = "response")
-ds_test_prob <- predict(ds_model, newdata = ds_matrix[test_idx, ], type = "response")
+naive_test_pred <- predict(naive_model, newdata = test_rows)
+ds_test_pred <- predict(ds_model, newdata = ds_matrix[test_idx, ])
 
-brier <- function(y, p) mean((y - p)^2)
+mse <- function(y, yhat) mean((y - yhat)^2)
 
-cat("Naive model  — test Brier score:", round(brier(test_rows$Protest, naive_test_prob), 4), "\n")
-cat("PDS model    — test Brier score:", round(brier(test_rows$Protest, ds_test_prob), 4), "\n")
+cat("Naive model  — test MSE:", round(mse(test_rows$Protest, naive_test_pred), 4), "\n")
+cat("PDS model    — test MSE:", round(mse(test_rows$Protest, ds_test_pred), 4), "\n")
 ```
 
 Note: this is a rough illustration only. Because both models were estimated on the full data, the test split is not truly held out. Exercise 3 below asks you to fix this properly.
