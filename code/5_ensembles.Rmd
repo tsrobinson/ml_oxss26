@@ -108,6 +108,7 @@ brier_score <- function(y_true, yhat_prob) {
 ## Estimate out-of-fold predictions
 
 ```{r}
+set.seed(89)
 fold_id <- make_folds(nrow(x_train), v = 5)
 
 oof_preds <- data.frame(
