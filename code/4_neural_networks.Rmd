@@ -110,116 +110,92 @@ x_train <- as.matrix(train_processed[, setdiff(names(train_processed), "votetrum
 x_test <- as.matrix(test_processed[, setdiff(names(test_processed), "votetrump")])
 ```
 
-## Build a neural network
+## Construct a neural network
+
+Now we are ready to build our neural network. The pipeline approach is similar to how you might construct a neural network in Python with `pytorch` or `tensorflow`:
 
 ```{r}
-build_mlp <- function(input_dim,
-                      hidden_units = c(64, 32),
-                      dropout = 0.25,
-                      learning_rate = 0.001) {
-  model <- keras_model_sequential()
+model <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = ncol(x_train)) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dense(units = 1, activation = "sigmoid") %>%
 
-  model <- model %>%
-    layer_input(shape = input_dim)
+  # Once defined, we compile the network
+  compile(
+    optimizer = "adam",
+    loss = "binary_crossentropy",
+    metrics = c("accuracy")
+  )
 
-  for (units in hidden_units) {
-    model <- model %>%
-      layer_dense(units = units, activation = "relu")
-
-    if (dropout > 0) {
-      model <- model %>%
-        layer_dropout(rate = dropout)
-    }
-  }
-
-  model %>%
-    layer_dense(units = 1, activation = "sigmoid") %>%
-    compile(
-      optimizer = optimizer_adam(learning_rate = learning_rate),
-      loss = "binary_crossentropy",
-      metrics = c("accuracy")
-    )
-}
-
-model <- build_mlp(
-  input_dim = ncol(x_train),
-  hidden_units = c(64, 32),
-  dropout = 0.25,
-  learning_rate = 0.001
-)
-```
-
-## Inspect the model
-
-```{r}
 summary(model)
 ```
 
-## Train with early stopping
+## Train the network
+
+The construction of the model is a separate step from fitting. The entire network already exists at construction — training *adjusts* the weights and biases to better learn the data relationships.
 
 ```{r}
 history <- fit(
   object = model,
   x = x_train,
   y = y_train,
-  batch_size = 256,
-  epochs = 40,
-  validation_split = 0.2,
-  callbacks = list(
-    callback_early_stopping(
-      monitor = "val_loss",
-      patience = 3,
-      restore_best_weights = TRUE
-    ),
-    callback_reduce_lr_on_plateau(
-      monitor = "val_loss",
-      factor = 0.5,
-      patience = 2
-    )
-  ),
-  verbose = 0
+  batch_size = 50,
+  epochs = 50,
+  validation_split = 0.3
 )
 ```
 
+## Dropout
+
+We discussed in the lecture that we can further regularise our model by implementing dropout, a form of random noise that blocks signals passing through certain nodes. In keras, dropout is just a layer we add after a layer of conventional nodes:
+
 ```{r}
-plot(history)
+model_w_dropout <- keras_model_sequential() %>%
+  layer_dense(units = 64, activation = "relu", input_shape = ncol(x_train)) %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 32, activation = "relu") %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 1, activation = "sigmoid") %>%
+
+  compile(
+    optimizer = "adam",
+    loss = "binary_crossentropy",
+    metrics = c("accuracy")
+  )
+
+history_dropout <- fit(
+  object = model_w_dropout,
+  x = x_train,
+  y = y_train,
+  batch_size = 50,
+  epochs = 50,
+  validation_split = 0.3
+)
 ```
 
 ## Evaluate out-of-sample performance
 
 ```{r}
-nn_test_prob <- as.numeric(predict(model, x_test, verbose = 0))
-nn_test_pred <- ifelse(nn_test_prob >= 0.5, 1, 0)
+# Model without dropout
+nn_pred <- ifelse(as.numeric(predict(model, x_test, verbose = 0)) >= 0.5, 1, 0)
+nn_acc <- mean(nn_pred == y_test)
 
-accuracy <- mean(nn_test_pred == y_test)
-brier <- mean((y_test - nn_test_prob) ^ 2)
+# Model with dropout
+nn_drop_pred <- ifelse(as.numeric(predict(model_w_dropout, x_test, verbose = 0)) >= 0.5, 1, 0)
+nn_drop_acc <- mean(nn_drop_pred == y_test)
 
 data.frame(
-  model = c("Baseline", "Neural network"),
-  accuracy = c(baseline_acc, accuracy),
-  brier = c(mean((y_test - mean(y_train)) ^ 2), brier)
+  model = c("Baseline (majority class)", "Neural network", "Neural network + dropout"),
+  accuracy = round(c(baseline_acc, nn_acc, nn_drop_acc), 4)
 )
 ```
 
-This is the main applied lesson from today: neural networks often require more preprocessing and more tuning than earlier models, so they should earn their place in the workflow by improving predictive performance or by solving a representation-learning problem that simpler models cannot handle well.
+Compare these accuracy numbers to your random forest and BART results from Day 3. Neural networks often require more preprocessing and tuning than tree-based methods, so they should earn their place in the workflow by outperforming simpler models.
 
 ## Exercises
 
-1. Compare this neural network to your random forest and BART results from Day 3. Does the neural network clearly outperform them?
+1. How does the neural network compare to the random forest/BART models from Day 3? Is that surprising?
 
-2. Change the architecture:
-   * number of hidden layers
-   * number of units
-   * dropout rate
-   * batch size
+2. Try to improve prediction accuracy by varying the network structure/hyperparameters (number of layers, units, dropout rate, batch size, optimizer).
 
-3. Try a multi-class version of the problem by predicting `"Trump"`, `"Clinton"`, or `"Other"`. What needs to change in the final layer and the loss function?
-
-4. Calculate performance separately by `gender` or `race`. Does the model perform similarly across groups?
-
-5. Introduce missingness into one or two predictors and compare:
-   * complete-case analysis
-   * simple imputation inside the train/test workflow
-   * an explicit missingness indicator
-
-Which choice looks safest substantively?
+3. Extend the network to a multi-class prediction problem: predict `"Trump"`, `"Clinton"`, or `"Other"`. Hint: think carefully about the final layer activation function and the loss function.
